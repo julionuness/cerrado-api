@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+ultralytics
+pillow
+sqlalchemy
+psycopg2-binary
+alembic
+python-multipart
+pydantic-settings
+bcrypt
