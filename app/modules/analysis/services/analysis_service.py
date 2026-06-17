@@ -1,6 +1,7 @@
 import io
 import os
 import uuid
+import numpy as np
 from PIL import Image
 from ultralytics import YOLO
 from sqlalchemy.orm import Session
@@ -48,7 +49,7 @@ class AnalysisService:
 
         prediction = self._run_model(image)
         disease_pt = _DISEASE_PT.get(prediction["disease"], prediction["disease"])
-        area = self._calculate_area(prediction["boxes"], prediction["img_width"], prediction["img_height"])
+        area = prediction["area_percentage"]
         confidence_level = self._calculate_confidence_level(prediction["confidence"])
         severity = self._calculate_severity(prediction["disease"], area)
         treatment = TREATMENTS.get(prediction["disease"], {}).get(severity)
@@ -91,31 +92,32 @@ class AnalysisService:
     def _run_model(self, image: Image.Image) -> dict:
         results = self._model(image)[0]
 
-        if len(results.boxes) == 0:
-            return {
-                "disease": "not_detected",
-                "confidence": 0.0,
-                "boxes": [],
-                "img_width": image.width,
-                "img_height": image.height,
-            }
+        if results.masks is None or len(results.boxes) == 0:
+            return {"disease": "not_detected", "confidence": 0.0, "area_percentage": 0.0}
 
-        best = max(results.boxes, key=lambda b: float(b.conf))
-        best_class = int(best.cls)
+        best_idx = int(max(range(len(results.boxes)), key=lambda i: float(results.boxes[i].conf)))
+        best_box = results.boxes[best_idx]
+        best_class = int(best_box.cls)
+        matching = [i for i, b in enumerate(results.boxes) if int(b.cls) == best_class]
 
-        class_boxes = [
-            b.xyxy[0].tolist()
-            for b in results.boxes
-            if int(b.cls) == best_class
-        ]
+        # Área real pelos polígonos da máscara de segmentação
+        image_area = image.width * image.height
+        total_area = sum(self._polygon_area(results.masks.xy[i]) for i in matching)
+        area_pct = round((total_area / image_area) * 100, 2) if image_area > 0 else 0.0
 
         return {
             "disease": results.names[best_class],
-            "confidence": round(float(best.conf), 4),
-            "boxes": class_boxes,
-            "img_width": image.width,
-            "img_height": image.height,
+            "confidence": round(float(best_box.conf), 4),
+            "area_percentage": area_pct,
         }
+
+    @staticmethod
+    def _polygon_area(pts) -> float:
+        pts = np.asarray(pts)
+        if len(pts) < 3:
+            return 0.0
+        x, y = pts[:, 0], pts[:, 1]
+        return 0.5 * abs(float(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1))))
 
     @staticmethod
     def _calculate_confidence_level(confidence: float) -> str:
@@ -128,14 +130,6 @@ class AnalysisService:
         return "baixa"
 
     @staticmethod
-    def _calculate_area(boxes: list, img_width: int, img_height: int) -> float:
-        img_area = img_width * img_height
-        if img_area == 0 or not boxes:
-            return 0.0
-        total = sum((x2 - x1) * (y2 - y1) for x1, y1, x2, y2 in boxes)
-        return round((total / img_area) * 100, 2)
-
-    @staticmethod
     def _calculate_severity(disease: str, area_percentage: float) -> str:
         if disease == "saudavel":
             return "saudavel"
@@ -146,22 +140,22 @@ class AnalysisService:
         if disease in ("ferrugem", "cercospora"):
             if area_percentage == 0:
                 return "nao_detectado"
-            elif area_percentage < 5:
+            elif area_percentage < 2:
                 return "leve"
-            elif area_percentage < 15:
+            elif area_percentage < 8:
                 return "moderada"
-            elif area_percentage < 30:
+            elif area_percentage < 18:
                 return "grave"
             return "severa"
 
         if disease == "bicho_mineiro":
             if area_percentage == 0:
                 return "nao_detectado"
-            elif area_percentage < 10:
+            elif area_percentage < 5:
                 return "leve"
-            elif area_percentage < 25:
+            elif area_percentage < 15:
                 return "moderada"
-            elif area_percentage < 50:
+            elif area_percentage < 35:
                 return "grave"
             return "severa"
 
