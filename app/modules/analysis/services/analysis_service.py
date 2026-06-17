@@ -41,7 +41,6 @@ class AnalysisService:
         if cls._instance is None:
             cls._instance = super().__new__(cls)
             cls._instance._model = YOLO(settings.MODEL_PATH)
-            cls._instance._detection_model = YOLO(settings.DETECTION_MODEL_PATH)
         return cls._instance
 
     def analyze(self, db: Session, user_id: UUID, filename: str, file_bytes: bytes) -> AnalysisResult:
@@ -79,32 +78,6 @@ class AnalysisService:
             image_url=image_url,
         )
 
-    def _get_leaf_reference_area(self, image: Image.Image, best_class: int) -> float:
-        det_results = self._detection_model(image)[0]
-        if len(det_results.boxes) == 0:
-            return float(image.width * image.height)
-
-        matching_boxes = [b for b in det_results.boxes if int(b.cls) == best_class]
-        if not matching_boxes:
-            matching_boxes = list(det_results.boxes)
-
-        x1 = min(float(b.xyxy[0][0]) for b in matching_boxes)
-        y1 = min(float(b.xyxy[0][1]) for b in matching_boxes)
-        x2 = max(float(b.xyxy[0][2]) for b in matching_boxes)
-        y2 = max(float(b.xyxy[0][3]) for b in matching_boxes)
-        return max((x2 - x1) * (y2 - y1), 1.0)
-
-    @staticmethod
-    def _union_mask_area(results, matching: list[int], image: Image.Image) -> float:
-        import torch.nn.functional as F
-        masks_data = results.masks.data  # (N, H_model, W_model)
-        matching_masks = masks_data[matching]
-        union = matching_masks.any(dim=0).float().unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
-        # dilata ~20px no espaço do modelo (~64px na imagem original) p/ incluir tecido necrótico ao redor
-        dilated = F.max_pool2d(union, kernel_size=41, stride=1, padding=20).squeeze()
-        scale = (image.width / masks_data.shape[2]) * (image.height / masks_data.shape[1])
-        return float(dilated.sum().item()) * scale
-
     @staticmethod
     def _save_image(original_filename: str, file_bytes: bytes) -> str:
         upload_dir = settings.UPLOAD_DIR
@@ -116,19 +89,21 @@ class AnalysisService:
         return f"/uploads/{saved_name}"
 
     def _run_model(self, image: Image.Image) -> dict:
-        results = self._model(image, conf=0.15)[0]
+        results = self._model(image)[0]
 
-        if results.masks is None or len(results.boxes) == 0:
+        if len(results.boxes) == 0:
             return {"disease": "not_detected", "confidence": 0.0, "area_percentage": 0.0}
 
         best_idx = int(max(range(len(results.boxes)), key=lambda i: float(results.boxes[i].conf)))
         best_box = results.boxes[best_idx]
         best_class = int(best_box.cls)
-        matching = [i for i, b in enumerate(results.boxes) if int(b.cls) == best_class]
 
-        ref_area = self._get_leaf_reference_area(image, best_class)
-        total_area = self._union_mask_area(results, matching, image)
-        area_pct = round((total_area / ref_area) * 100, 2) if ref_area > 0 else 0.0
+        area_pct = 0.0
+        if results.masks is not None and len(results.masks.data) > 0:
+            matching = [i for i, b in enumerate(results.boxes) if int(b.cls) == best_class]
+            masks = results.masks.data[matching]
+            union_fraction = float(masks.any(dim=0).float().mean().item())
+            area_pct = round(min(union_fraction * 1000, 100.0), 2)
 
         return {
             "disease": results.names[best_class],
@@ -157,22 +132,22 @@ class AnalysisService:
         if disease in ("ferrugem", "cercospora"):
             if area_percentage == 0:
                 return "nao_detectado"
-            elif area_percentage < 5:
+            elif area_percentage < 25:
                 return "leve"
-            elif area_percentage < 15:
+            elif area_percentage < 50:
                 return "moderada"
-            elif area_percentage < 30:
+            elif area_percentage < 75:
                 return "grave"
             return "severa"
 
         if disease == "bicho_mineiro":
             if area_percentage == 0:
                 return "nao_detectado"
-            elif area_percentage < 10:
-                return "leve"
             elif area_percentage < 25:
-                return "moderada"
+                return "leve"
             elif area_percentage < 50:
+                return "moderada"
+            elif area_percentage < 75:
                 return "grave"
             return "severa"
 
